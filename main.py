@@ -200,7 +200,9 @@ def save_alert(frame, cam_id, roi_id, alert_type="empty", time_val="", polygon=N
     save_path = os.path.join(ALERTS_DIR, branch, cam_id, folder_date)
     os.makedirs(save_path, exist_ok=True)
     
-    filename = f"alert-{alert_type.replace('_', '-')}_{site_id}_{cam_id}_{file_date}_{time_str}.png"
+    filename = (
+    f"alert-{alert_type.replace('_', '-')}_"
+    f"{site_id}_{cam_id}_{roi_id}_{file_date}_{time_str}.png")
     full_image_path = os.path.join(save_path, filename)
     cv2.imwrite(full_image_path, alert_frame)
     
@@ -477,6 +479,8 @@ def main(selected_camera=None, display=False, ignore_hours=False, config_file="s
                 "empty_since": None,
                 "empty_alert_sent": False,
                 "last_empty_time_str": "",
+                "last_empty_frame": None,
+                "last_empty_alert_time_str": "",
                 "last_alert_time": 0
             } for roi_id in cam_info["rois"]
         }
@@ -544,6 +548,8 @@ def main(selected_camera=None, display=False, ignore_hours=False, config_file="s
                         s["empty_since"] = None
                         s["empty_alert_sent"] = False
                         s["last_empty_time_str"] = ""
+                        s["last_empty_frame"] = None
+                        s["last_empty_alert_time_str"] = ""
                         s["last_alert_time"] = 0
                 last_daily_reset_date = today
                 print(f"[DAILY RESET] Cleared rack state for {today}")
@@ -577,6 +583,35 @@ def main(selected_camera=None, display=False, ignore_hours=False, config_file="s
                         if target_frame is not None and is_valid_frame(target_frame):
                             print(f"!!! ALERT !!! {cam_id} {label.upper()} at {target_time}")
                             save_alert(target_frame, cam_id, "camera", label, target_time)
+
+                        # 10 PM CLOSING PACKAGE:
+                        # Re-save the latest EMPTY proof for every ROI that
+                        # actually generated an empty alert during the day.
+                        # This does NOT trigger a new empty event or affect
+                        # the ROI 30-minute cooldown. The original empty
+                        # alert time is preserved in the closing package.
+                        for roi_id, roi_state in cam_data["state"].items():
+                            closing_frame = roi_state.get("last_empty_frame")
+                            closing_time = roi_state.get("last_empty_alert_time_str", "")
+
+                            if closing_frame is not None and is_valid_frame(closing_frame):
+                                print(
+                                    f"!!! CLOSING PACKAGE !!! {cam_id} - "
+                                    f"{roi_id} EMPTY at {closing_time}"
+                                )
+                                save_alert(
+                                    closing_frame.copy(),
+                                    cam_id,
+                                    roi_id,
+                                    "empty",
+                                    closing_time,
+                                    polygon=cam_data["rois"].get(roi_id),
+                                    extra_metadata={
+                                        "closing_package": True,
+                                        "original_empty_event_time": closing_time,
+                                        "closing_package_time": now.strftime("%H:%M")
+                                    }
+                                )
                         
                         cam_state["last_removal_alert_sent"] = True
                     continue
@@ -691,8 +726,56 @@ def main(selected_camera=None, display=False, ignore_hours=False, config_file="s
                         cam_state["first_placement_done"] = True
                         camera_first_placement_sent_now = True
                         print(f"!!! ALERT !!! {cam_id} FIRST PLACEMENT avg detections {avg_detection_count:.1f}")
+
+                        # Save the camera-level First Placement image.
                         extra_meta = {"avg_detections": round(avg_detection_count, 1)}
-                        save_alert(frame.copy(), cam_id, "camera", "first_placement", now.strftime("%H:%M"), extra_metadata=extra_meta)
+                        save_alert(
+                            frame.copy(),
+                            cam_id,
+                            "camera",
+                            "first_placement",
+                            now.strftime("%H:%M"),
+                            extra_metadata=extra_meta
+                        )
+
+                        # FIRST-PLACEMENT ROI IMAGES:
+                        # Immediately save an individual Placed image for every
+                        # ROI that is occupied at the moment First Placement
+                        # is triggered. This initial ROI placement bypasses the
+                        # normal 30-minute cooldown.
+                        for first_roi_id, first_poly in rois.items():
+                            first_detection_count = roi_detection_counts[first_roi_id]
+
+                            if first_detection_count >= MIN_DETECTIONS_FOR_OCCUPIED:
+                                first_roi_state = state[first_roi_id]
+
+                                print(
+                                    f"!!! ALERT !!! {cam_id} - {first_roi_id} "
+                                    f"FIRST PLACEMENT ROI PLACED "
+                                    f"(detections={first_detection_count})"
+                                )
+
+                                first_roi_meta = {
+                                    "detection_count": first_detection_count,
+                                    "first_placement_roi": True
+                                }
+
+                                save_alert(
+                                    frame.copy(),
+                                    cam_id,
+                                    first_roi_id,
+                                    "placed",
+                                    now.strftime("%H:%M"),
+                                    polygon=first_poly,
+                                    extra_metadata=first_roi_meta
+                                )
+
+                                # Mark this ROI occupied and start its normal
+                                # cooldown from this initial Placed event.
+                                first_roi_state["occupied"] = True
+                                first_roi_state["empty_since"] = None
+                                first_roi_state["empty_alert_sent"] = False
+                                first_roi_state["last_alert_time"] = now_ts
                 elif cam_state["occupied"]:
                     # Transition from Occupied -> Empty
                     cam_state["occupied"] = False
@@ -733,11 +816,27 @@ def main(selected_camera=None, display=False, ignore_hours=False, config_file="s
                                     if not s["empty_alert_sent"]:
                                         # COOLDOWN CHECK
                                         if (now_ts - s["last_alert_time"]) > COOLDOWN_SECONDS:
-                                            print(f"!!! ALERT !!! {cam_id} - {roi_id} EMPTY for {int(elapsed)}s")
-                                            extra_meta = {"empty_duration_seconds": int(elapsed)}
-                                            save_alert(frame.copy(), cam_id, roi_id, "empty", s["last_empty_time_str"], polygon=poly, extra_metadata=extra_meta)
-                                            s["empty_alert_sent"] = True
-                                            s["last_alert_time"] = now_ts
+                                            # Prevent Empty alerts before the store has officially placed items
+                                            if cam_state["first_placement_done"]:
+                                                print(f"!!! ALERT !!! {cam_id} - {roi_id} EMPTY for {int(elapsed)}s")
+                                                extra_meta = {"empty_duration_seconds": int(elapsed)}
+
+                                                # Remember the latest EMPTY proof for the
+                                                # 10 PM closing package.
+                                                s["last_empty_frame"] = frame.copy()
+                                                s["last_empty_alert_time_str"] = now.strftime("%H:%M")
+
+                                                save_alert(
+                                                    frame.copy(),
+                                                    cam_id,
+                                                    roi_id,
+                                                    "empty",
+                                                    s["last_empty_time_str"],
+                                                    polygon=poly,
+                                                    extra_metadata=extra_meta
+                                                )
+                                                s["empty_alert_sent"] = True
+                                                s["last_alert_time"] = now_ts
 
             # Refresh GUI windows with new detections immediately (Windows HighGUI support)
             if DEBUG_WINDOW_ENABLED:
