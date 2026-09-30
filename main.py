@@ -796,13 +796,14 @@ def main(selected_camera=None, display=False, ignore_hours=False, config_file="s
                         
                         if not s["occupied"]:
                             s["occupied"] = True
-                            # COOLDOWN CHECK
-                            if (now_ts - s["last_alert_time"]) > COOLDOWN_SECONDS:
-                                if cam_state["first_placement_done"] and not camera_first_placement_sent_now:
-                                    print(f"!!! ALERT !!! {cam_id} - {roi_id} PLACED")
-                                    extra_meta = {"detection_count": detection_count}
-                                    save_alert(frame.copy(), cam_id, roi_id, "placed", now.strftime("%H:%M"), polygon=poly, extra_metadata=extra_meta)
-                                    s["last_alert_time"] = now_ts
+                            # PLACED ALERTS IGNORE COOLDOWN
+                            # We always want to know immediately if a tray is restocked!
+                            if cam_state["first_placement_done"] and not camera_first_placement_sent_now:
+                                print(f"!!! ALERT !!! {cam_id} - {roi_id} PLACED")
+                                extra_meta = {"detection_count": detection_count}
+                                save_alert(frame.copy(), cam_id, roi_id, "placed", now.strftime("%H:%M"), polygon=poly, extra_metadata=extra_meta)
+                                # Reset the cooldown timer so the NEXT empty alert is delayed by 30 mins
+                                s["last_alert_time"] = now_ts
                     else:
                         if s["empty_since"] is None:
                             s["empty_since"] = now_ts
@@ -813,30 +814,32 @@ def main(selected_camera=None, display=False, ignore_hours=False, config_file="s
                             if elapsed > EMPTY_REQUIRED_SECONDS:
                                 if s["occupied"]:
                                     s["occupied"] = False
-                                    if not s["empty_alert_sent"]:
-                                        # COOLDOWN CHECK
-                                        if (now_ts - s["last_alert_time"]) > COOLDOWN_SECONDS:
-                                            # Prevent Empty alerts before the store has officially placed items
-                                            if cam_state["first_placement_done"]:
-                                                print(f"!!! ALERT !!! {cam_id} - {roi_id} EMPTY for {int(elapsed)}s")
-                                                extra_meta = {"empty_duration_seconds": int(elapsed)}
+                                    
+                                if not s["empty_alert_sent"]:
+                                    # COOLDOWN CHECK
+                                    if (now_ts - s["last_alert_time"]) > COOLDOWN_SECONDS:
+                                        # Allow Empty alerts if first placement is done OR if it's 10:30 AM or later (late setup warning)
+                                        current_time_str = now.strftime("%H:%M")
+                                        if cam_state["first_placement_done"] or current_time_str >= "10:30":
+                                            print(f"!!! ALERT !!! {cam_id} - {roi_id} EMPTY for {int(elapsed)}s")
+                                            extra_meta = {"empty_duration_seconds": int(elapsed)}
 
-                                                # Remember the latest EMPTY proof for the
-                                                # 10 PM closing package.
-                                                s["last_empty_frame"] = frame.copy()
-                                                s["last_empty_alert_time_str"] = now.strftime("%H:%M")
+                                            # Remember the latest EMPTY proof for the
+                                            # 10 PM closing package.
+                                            s["last_empty_frame"] = frame.copy()
+                                            s["last_empty_alert_time_str"] = now.strftime("%H:%M")
 
-                                                save_alert(
-                                                    frame.copy(),
-                                                    cam_id,
-                                                    roi_id,
-                                                    "empty",
-                                                    s["last_empty_time_str"],
-                                                    polygon=poly,
-                                                    extra_metadata=extra_meta
-                                                )
-                                                s["empty_alert_sent"] = True
-                                                s["last_alert_time"] = now_ts
+                                            save_alert(
+                                                frame.copy(),
+                                                cam_id,
+                                                roi_id,
+                                                "empty",
+                                                s["last_empty_time_str"],
+                                                polygon=poly,
+                                                extra_metadata=extra_meta
+                                            )
+                                            s["empty_alert_sent"] = True
+                                            s["last_alert_time"] = now_ts
 
             # Refresh GUI windows with new detections immediately (Windows HighGUI support)
             if DEBUG_WINDOW_ENABLED:
