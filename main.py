@@ -821,6 +821,10 @@ def main(selected_camera=None, display=False, ignore_hours=False, config_file="s
                                         # Allow Empty alerts if first placement is done OR if it's 10:30 AM or later (late setup warning)
                                         current_time_str = now.strftime("%H:%M")
                                         if cam_state["first_placement_done"] or current_time_str >= "10:30":
+                                            # If this is the morning setup warning, use the time it actually became empty
+                                            if not s["last_empty_time_str"]:
+                                                s["last_empty_time_str"] = datetime.fromtimestamp(s["empty_since"], tz=IST).strftime("%H:%M")
+
                                             print(f"!!! ALERT !!! {cam_id} - {roi_id} EMPTY for {int(elapsed)}s")
                                             extra_meta = {"empty_duration_seconds": int(elapsed)}
 
