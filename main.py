@@ -48,8 +48,8 @@ TARGET_FPS = 4.0 # Set the desired processing rate per camera (e.g., 1.0 FPS)
 SLEEP_DURATION = 1.0 / TARGET_FPS if TARGET_FPS > 0 else 0
 
 # Alert Logic
-EMPTY_REQUIRED_SECONDS = 3 * 60     # 3 Minutes
-COOLDOWN_SECONDS = 30 * 60          # 30 Minutes
+EMPTY_REQUIRED_SECONDS = 3 * 60     # 3 minutes empty
+PLACED_REQUIRED_SECONDS = 3 * 60    # 3 minutes occupied
 MIN_DETECTIONS_FOR_OCCUPIED = 2     # Minimum jewels/items needed inside an ROI to count as placed
 STORE_OPEN_TIME = "10:00"
 STORE_CLOSE_TIME = "22:00"
@@ -182,20 +182,28 @@ def save_alert(frame, cam_id, roi_id, alert_type="empty", time_val="", polygon=N
     
     # Highlight the specific zone (polygon) if provided
     if polygon is not None:
-        scaled_poly = scale_polygon(polygon)
-        pts = np.array(scaled_poly, np.int32).reshape((-1, 1, 2))
-        
-        # Determine highlight color based on alert type
-        if alert_type in ["empty", "last_removal", "closing_state"]:
-            color = (0, 0, 255)  # Red for empty/removal
+        if len(polygon) > 0 and isinstance(polygon[0][0], (int, float)):
+            polys = [polygon]
         else:
-            color = (0, 255, 0)  # Green for placed
+            polys = polygon
+
+        for poly in polys:
+            scaled_poly = scale_polygon(poly)
+            pts = np.array(scaled_poly, np.int32).reshape((-1, 1, 2))
             
-        cv2.polylines(alert_frame, [pts], True, color, 3)
-        # Also add a semi-transparent overlay
-        overlay = alert_frame.copy()
-        cv2.fillPoly(overlay, [pts], color)
-        cv2.addWeighted(overlay, 0.2, alert_frame, 0.8, 0, alert_frame)
+            # Determine highlight color based on alert type
+            if alert_type in ["empty", "closing_state"]:
+                color = (0, 0, 255)  # Red for empty or items left at closing
+            elif alert_type == "last_removal":
+                color = (255, 0, 0)  # Blue for final removal
+            else:
+                color = (0, 255, 0)  # Green for placed
+                
+            cv2.polylines(alert_frame, [pts], True, color, 3)
+            # Also add a semi-transparent overlay
+            overlay = alert_frame.copy()
+            cv2.fillPoly(overlay, [pts], color)
+            cv2.addWeighted(overlay, 0.2, alert_frame, 0.8, 0, alert_frame)
     
     save_path = os.path.join(ALERTS_DIR, branch, cam_id, folder_date)
     os.makedirs(save_path, exist_ok=True)
@@ -354,10 +362,8 @@ class StreamLoader:
 
             # End of Video or Connection Loss Handler
             if self.is_video_file:
-                # Seamless loop: rewind back to the beginning of the video
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                time.sleep(0.05)
-                continue
+                self.running = False
+                break
             else:
                 self.cap.release()
                 self.cap = None
@@ -421,7 +427,7 @@ class Detector:
         return batch_boxes
 
 def main(selected_camera=None, display=False, ignore_hours=False, config_file="somajiguda.json", video_file=None):
-    global DEBUG_WINDOW_ENABLED
+    global DEBUG_WINDOW_ENABLED, STORE_CLOSE_TIME
     if display:
         DEBUG_WINDOW_ENABLED = True
 
@@ -475,9 +481,11 @@ def main(selected_camera=None, display=False, ignore_hours=False, config_file="s
             roi_id: {
                 "occupied": False,
                 "empty_since": None,
+                "occupied_since": None,
                 "empty_alert_sent": False,
                 "last_empty_time_str": "",
-                "last_alert_time": 0
+                "last_empty_frame": None,
+                "last_empty_alert_time_str": "",
             } for roi_id in cam_info["rois"]
         }
         
@@ -542,14 +550,35 @@ def main(selected_camera=None, display=False, ignore_hours=False, config_file="s
                         s = cam_data["state"][roi_id]
                         s["occupied"] = False
                         s["empty_since"] = None
+                        s["occupied_since"] = None
                         s["empty_alert_sent"] = False
                         s["last_empty_time_str"] = ""
-                        s["last_alert_time"] = 0
+                        s["last_empty_frame"] = None
+                        s["last_empty_alert_time_str"] = ""
                 last_daily_reset_date = today
                 print(f"[DAILY RESET] Cleared rack state for {today}")
             
             batch_frames = []
             batch_cam_ids = []
+            
+            # Auto-trigger Last Removal when video finishes
+            if video_file:
+                all_dead = True
+                for cam_data in cameras.values():
+                    if cam_data["stream"].running:
+                        all_dead = False
+                        break
+                
+                if all_dead:
+                    if is_open:
+                        print("[INFO] Video ended! Automatically triggering Last Removal audit...")
+                        ignore_hours = False
+                        STORE_CLOSE_TIME = "00:00"
+                        is_open = False
+                        # Do NOT continue here; let it fall through and run the audit below.
+                    else:
+                        # On the second pass, after audit is complete, exit.
+                        break
 
             for cam_id, cam_data in cameras.items():
                 frame = cam_data["stream"].read()
@@ -576,8 +605,9 @@ def main(selected_camera=None, display=False, ignore_hours=False, config_file="s
 
                         if target_frame is not None and is_valid_frame(target_frame):
                             print(f"!!! ALERT !!! {cam_id} {label.upper()} at {target_time}")
-                            save_alert(target_frame, cam_id, "camera", label, target_time)
-                        
+                            all_polys = list(cam_data["rois"].values())
+                            save_alert(target_frame, cam_id, "camera", label, target_time, polygon=all_polys)
+
                         cam_state["last_removal_alert_sent"] = True
                     continue
                 
@@ -692,7 +722,13 @@ def main(selected_camera=None, display=False, ignore_hours=False, config_file="s
                         camera_first_placement_sent_now = True
                         print(f"!!! ALERT !!! {cam_id} FIRST PLACEMENT avg detections {avg_detection_count:.1f}")
                         extra_meta = {"avg_detections": round(avg_detection_count, 1)}
-                        save_alert(frame.copy(), cam_id, "camera", "first_placement", now.strftime("%H:%M"), extra_metadata=extra_meta)
+                        
+                        occupied_polys = []
+                        for rid, poly in rois.items():
+                            if roi_detection_counts[rid] >= MIN_DETECTIONS_FOR_OCCUPIED:
+                                occupied_polys.append(poly)
+                                
+                        save_alert(frame.copy(), cam_id, "camera", "first_placement", now.strftime("%H:%M"), polygon=occupied_polys, extra_metadata=extra_meta)
                 elif cam_state["occupied"]:
                     # Transition from Occupied -> Empty
                     cam_state["occupied"] = False
@@ -712,15 +748,20 @@ def main(selected_camera=None, display=False, ignore_hours=False, config_file="s
                         s["empty_alert_sent"] = False
                         
                         if not s["occupied"]:
-                            s["occupied"] = True
-                            # COOLDOWN CHECK
-                            if (now_ts - s["last_alert_time"]) > COOLDOWN_SECONDS:
-                                if cam_state["first_placement_done"] and not camera_first_placement_sent_now:
-                                    print(f"!!! ALERT !!! {cam_id} - {roi_id} PLACED")
-                                    extra_meta = {"detection_count": detection_count}
+                            if camera_first_placement_sent_now:
+                                # Silently mark as occupied because it was included in the camera-level First Placement
+                                s["occupied"] = True
+                            elif s.get("occupied_since") is None:
+                                s["occupied_since"] = now_ts
+                            else:
+                                elapsed = now_ts - s["occupied_since"]
+                                if elapsed > PLACED_REQUIRED_SECONDS:
+                                    s["occupied"] = True
+                                    print(f"!!! ALERT !!! {cam_id} - {roi_id} PLACED for {int(elapsed)}s")
+                                    extra_meta = {"detection_count": detection_count, "placed_duration_seconds": int(elapsed)}
                                     save_alert(frame.copy(), cam_id, roi_id, "placed", now.strftime("%H:%M"), polygon=poly, extra_metadata=extra_meta)
-                                    s["last_alert_time"] = now_ts
                     else:
+                        s["occupied_since"] = None
                         if s["empty_since"] is None:
                             s["empty_since"] = now_ts
                             if s["occupied"]:
@@ -731,13 +772,22 @@ def main(selected_camera=None, display=False, ignore_hours=False, config_file="s
                                 if s["occupied"]:
                                     s["occupied"] = False
                                     if not s["empty_alert_sent"]:
-                                        # COOLDOWN CHECK
-                                        if (now_ts - s["last_alert_time"]) > COOLDOWN_SECONDS:
+                                        # Allow Empty alerts if first placement is done OR if it's 23:59 AM or later (late setup warning)
+                                        current_time_str = now.strftime("%H:%M")
+                                        if cam_state["first_placement_done"] or current_time_str >= "23:59":
+                                            if not s["last_empty_time_str"]:
+                                                s["last_empty_time_str"] = datetime.fromtimestamp(s["empty_since"], tz=IST).strftime("%H:%M")
+                                                
                                             print(f"!!! ALERT !!! {cam_id} - {roi_id} EMPTY for {int(elapsed)}s")
                                             extra_meta = {"empty_duration_seconds": int(elapsed)}
+                                            
+                                            # Remember the latest EMPTY proof for the
+                                            # 10 PM closing package.
+                                            s["last_empty_frame"] = frame.copy()
+                                            s["last_empty_alert_time_str"] = now.strftime("%H:%M")
+                                            
                                             save_alert(frame.copy(), cam_id, roi_id, "empty", s["last_empty_time_str"], polygon=poly, extra_metadata=extra_meta)
                                             s["empty_alert_sent"] = True
-                                            s["last_alert_time"] = now_ts
 
             # Refresh GUI windows with new detections immediately (Windows HighGUI support)
             if DEBUG_WINDOW_ENABLED:
